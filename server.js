@@ -87,7 +87,124 @@ const REFERRAL_BONUS_REFEREE = Number(process.env.REFERRAL_BONUS_REFEREE || 50);
 const REFERRAL_BONUS_REFERRER = Number(process.env.REFERRAL_BONUS_REFERRER || 50); // flat BIGO, referrer's bonus
 const DECIMALS = 18;
 
-app.get("/health", async (_, res) => res.json({ ok: true, configured: !!(vault && signer), nftBonus: !!nftContract }));
+// --- Bigo Network Collection ($4 NFT, Polygon ERC-1155) — 500,000 BIGO reward per NFT ---
+// Rule: a wallet is eligible for the NFTs it bought from the official sale wallet (primary sales),
+// limited to how many it still holds. Passing NFTs to other wallets never creates new claims, because
+// only transfers OUT of the sale wallet count. The BSC claim contract remembers how many NFTs each
+// wallet has been paid for, so every eligible NFT is paid at most once.
+const NFT2_CONTRACT = (process.env.NFT2_CONTRACT || "0x33c68838bA2E5A405d37bE81050300b12082Df22");
+const NFT2_TOKEN_ID = BigInt(process.env.NFT2_TOKEN_ID || 1);
+const NFT2_SALE_WALLET = (process.env.NFT2_SALE_WALLET || "0x50aa47572f342b183ac8b324246e730fc84bedc0").toLowerCase();
+const NFT2_START_BLOCK = process.env.NFT2_START_BLOCK || "0x59ca361"; // collection mint block
+const NFT2_TRANSFERS_RPC = process.env.NFT2_TRANSFERS_RPC || ""; // Alchemy Polygon URL (alchemy_getAssetTransfers)
+const NFT2_EXCLUDE = (process.env.NFT2_EXCLUDE || "0x577d663f97f70726ba34445877e79fc16022c879,0x0ac48971f304c4b42ad6f2e443bd3687a6bd0a1d")
+  .toLowerCase().split(",").map(a => a.trim()).filter(Boolean); // project wallets never eligible
+const NFT_CLAIM_ADDRESS = process.env.NFT_CLAIM_ADDRESS || ""; // BigoNFTRewardClaim on BSC
+const nft2 = nftProvider ? new Contract(NFT2_CONTRACT, ["function balanceOf(address,uint256) view returns(uint256)"], nftProvider) : null;
+const nftClaim = NFT_CLAIM_ADDRESS ? new Contract(NFT_CLAIM_ADDRESS, [
+  "function claimedUnits(address) view returns(uint256)",
+  "function rewardPerNft() view returns(uint256)",
+  "function rewardBalance() view returns(uint256)",
+  "function paused() view returns(bool)",
+  "function signer() view returns(address)"
+], provider) : null;
+const nftClaimDomain = () => ({ name: "Bigo NFT Reward Claim", version: "1", chainId: 56, verifyingContract: NFT_CLAIM_ADDRESS });
+const nftClaimTypes = { NftClaim: [
+  { name: "account", type: "address" },
+  { name: "eligibleUnits", type: "uint256" },
+  { name: "deadline", type: "uint256" }
+]};
+
+// Cached list of primary-sale purchases per buyer, refreshed at most every 30 seconds.
+let saleCache = { at: 0, bought: null, pending: null };
+async function primarySales() {
+  if (!NFT2_TRANSFERS_RPC) throw new Error("NFT2_TRANSFERS_RPC not set");
+  if (saleCache.bought && Date.now() - saleCache.at < 30000) return saleCache.bought;
+  if (saleCache.pending) return saleCache.pending;
+  saleCache.pending = (async () => {
+    const bought = {};
+    let pageKey;
+    do {
+      const r = await fetch(NFT2_TRANSFERS_RPC, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "alchemy_getAssetTransfers", params: [{
+          fromBlock: NFT2_START_BLOCK, toBlock: "latest", fromAddress: NFT2_SALE_WALLET,
+          contractAddresses: [NFT2_CONTRACT], category: ["erc1155"], excludeZeroValue: true,
+          maxCount: "0x3e8", ...(pageKey ? { pageKey } : {})
+        }]})
+      });
+      const j = await r.json();
+      if (j.error || !j.result) throw new Error((j.error && j.error.message) || "transfer lookup failed");
+      for (const t of j.result.transfers) {
+        const to = (t.to || "").toLowerCase();
+        for (const m of (t.erc1155Metadata || [])) {
+          if (BigInt(m.tokenId) === NFT2_TOKEN_ID) bought[to] = (bought[to] || 0n) + BigInt(m.value);
+        }
+      }
+      pageKey = j.result.pageKey;
+    } while (pageKey);
+    saleCache = { at: Date.now(), bought, pending: null };
+    return bought;
+  })().catch(e => { saleCache.pending = null; throw e; });
+  return saleCache.pending;
+}
+
+async function nftEligibility(account) {
+  const bought = NFT2_EXCLUDE.includes(account) ? 0n : ((await primarySales())[account] || 0n);
+  const held = nft2 ? await nft2.balanceOf(account, NFT2_TOKEN_ID) : 0n;
+  const eligible = bought < held ? bought : held;
+  const claimed = nftClaim ? await nftClaim.claimedUnits(account) : 0n;
+  const claimable = eligible > claimed ? eligible - claimed : 0n;
+  return { bought, held, eligible, claimed, claimable };
+}
+
+app.get("/nft-eligibility", async (req, res) => {
+  try {
+    const account = String(req.query.account || "").toLowerCase();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(account)) return res.status(400).json({ error: "Invalid account" });
+    const e = await nftEligibility(account);
+    res.json({
+      bought: e.bought.toString(), held: e.held.toString(), eligible: e.eligible.toString(),
+      claimed: e.claimed.toString(), claimable: e.claimable.toString(),
+      rewardPerNft: "500000", claimsOpen: !!(nftClaim && signer), claimContract: NFT_CLAIM_ADDRESS || null
+    });
+  } catch (e) {
+    res.status(503).json({ error: "Could not check eligibility right now. Please try again in a moment." });
+  }
+});
+
+app.post("/nft-claim-voucher", async (req, res) => {
+  try {
+    if (!nftClaim || !signer) return res.status(503).json({ error: "NFT reward claims are not open yet." });
+    const account = (req.body.account || "").toLowerCase();
+    if (!/^0x[a-fA-F0-9]{40}$/.test(account)) return res.status(400).json({ error: "Invalid account" });
+    if (await nftClaim.paused()) return res.status(503).json({ error: "Claims are paused right now." });
+
+    const e = await nftEligibility(account);
+    if (e.claimable === 0n) {
+      return res.status(400).json({ error: e.eligible === 0n
+        ? "This wallet has no eligible NFTs. Rewards go to wallets that bought from the official sale and still hold the NFTs."
+        : "You have already claimed the reward for all your eligible NFTs." });
+    }
+    const perNft = await nftClaim.rewardPerNft();
+    const owed = e.claimable * perNft;
+    if ((await nftClaim.rewardBalance()) < owed) {
+      return res.status(503).json({ error: "The reward pool is being topped up. Please try again later." });
+    }
+    const deadline = Math.floor(Date.now() / 1000) + 600; // 10 minutes to submit
+    const message = { account, eligibleUnits: e.eligible, deadline };
+    const signature = await signer.signTypedData(nftClaimDomain(), nftClaimTypes, message);
+    res.json({
+      eligibleUnits: e.eligible.toString(), deadline, signature,
+      newUnits: e.claimable.toString(), humanAmount: formatUnits(owed, DECIMALS),
+      claimContract: NFT_CLAIM_ADDRESS
+    });
+  } catch (e) {
+    res.status(503).json({ error: "Could not prepare your claim right now. Please try again in a moment." });
+  }
+});
+
+app.get("/health", async (_, res) => res.json({ ok: true, configured: !!(vault && signer), nftBonus: !!nftContract, nftClaims: !!(nftClaim && signer && NFT2_TRANSFERS_RPC) }));
 
 // Call this once, before a new user's first claim, to link them to whoever referred them.
 app.post("/register-referral", (req, res) => {
